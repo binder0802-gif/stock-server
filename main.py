@@ -3,6 +3,12 @@ from datetime import date, datetime, timedelta
 import urllib.request
 import json
 import time
+import ssl
+
+# =========================
+# 重要：解決 Render 上的 SSL 驗證失敗
+# =========================
+ssl._create_default_https_context = ssl._create_unverified_context
 
 app = FastAPI()
 
@@ -16,7 +22,7 @@ def root():
 
 # -------------------------
 # 小型快取（避免一直抓）
-# 以 query key 做 cache，TTL 秒數可調
+# - Free 方案重啟會清空（之後要永久不爬，需加 DB）
 # -------------------------
 CACHE_TTL_SEC = 300  # 5 分鐘
 _cache = {}  # key -> {"t": epoch, "value": any}
@@ -53,7 +59,6 @@ def _safe_int(s, default=0):
         s = str(s).replace(",", "").strip()
         if s in ["", "--"]:
             return default
-        # 有些 API 會回 "12,345" 或 "12345.0"
         return int(float(s))
     except:
         return default
@@ -87,7 +92,6 @@ def _fetch_twse_month(stock_id: str, year: int, month: int):
         f"?response=json&date={date_str}&stockNo={stock_id}"
     )
 
-    # 雲端環境常需要 header 才不會回空/被擋
     req = urllib.request.Request(
         url,
         headers={
@@ -98,7 +102,7 @@ def _fetch_twse_month(stock_id: str, year: int, month: int):
         },
     )
 
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=25) as resp:
         raw = resp.read().decode("utf-8")
 
     data = json.loads(raw)
@@ -109,7 +113,6 @@ def _fetch_twse_month(stock_id: str, year: int, month: int):
 def get_history_twse(stock_id: str, start_dt: date, end_dt: date):
     all_rows = []
     for yy, mm in _month_iter(start_dt, end_dt):
-        # 這裡不再默默跳過，真的錯就丟出來，方便你知道原因
         rows = _fetch_twse_month(stock_id, yy, mm)
         all_rows.extend(rows)
 
@@ -144,14 +147,14 @@ def get_history_twse(stock_id: str, start_dt: date, end_dt: date):
 
 
 # =========================================================
-# 2) TPEx（上櫃）: openapi 每日抓「整個市場」，再挑出該股票
-#    注意：這種逐日抓會比較慢，但可當 fallback
+# 2) TPEx（上櫃）: openapi 每日抓全市場，再挑出該股票
 # =========================================================
 def _fetch_tpex_daily_all(roc_date: str):
     url = (
         "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
         f"?l=zh-tw&d={roc_date}&s=0,asc,0"
     )
+
     req = urllib.request.Request(
         url,
         headers={
@@ -161,8 +164,10 @@ def _fetch_tpex_daily_all(roc_date: str):
             "Connection": "close",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+
+    with urllib.request.urlopen(req, timeout=35) as resp:
         raw = resp.read().decode("utf-8")
+
     data = json.loads(raw)
     if not isinstance(data, list):
         raise ValueError("TPEx 回傳格式非 list")
@@ -218,8 +223,6 @@ def get_history_tpex(stock_id: str, start_dt: date, end_dt: date):
 
 # =========================================================
 # 對外 API：/stock/history
-# - 先 TWSE，失敗就改用 TPEx
-# - 回傳 JSON
 # =========================================================
 @app.get("/stock/history")
 def stock_history(stock_id: str, start: str, end: str):
@@ -239,6 +242,7 @@ def stock_history(stock_id: str, start: str, end: str):
         return cached
 
     # 先試 TWSE（上市）
+    twse_error = None
     try:
         data = get_history_twse(stock_id, start_dt, end_dt)
         if data:
@@ -248,18 +252,13 @@ def stock_history(stock_id: str, start: str, end: str):
                 "start": start_dt.isoformat(),
                 "end": end_dt.isoformat(),
                 "count": len(data),
-                "data": [
-                    {**d, "dt": d["dt"].isoformat()}
-                    for d in data
-                ]
+                "data": [{**d, "dt": d["dt"].isoformat()} for d in data],
             }
             cache_set(cache_key, payload)
             return payload
-    except Exception as e:
-        # TWSE 抓不到不直接報錯，改走 TPEx（上櫃）
-        twse_error = str(e)
-    else:
         twse_error = "TWSE 回空資料"
+    except Exception as e:
+        twse_error = str(e)
 
     # 再試 TPEx（上櫃）
     try:
@@ -271,15 +270,11 @@ def stock_history(stock_id: str, start: str, end: str):
                 "start": start_dt.isoformat(),
                 "end": end_dt.isoformat(),
                 "count": len(data2),
-                "data": [
-                    {**d, "dt": d["dt"].isoformat()}
-                    for d in data2
-                ]
+                "data": [{**d, "dt": d["dt"].isoformat()} for d in data2],
             }
             cache_set(cache_key, payload)
             return payload
     except Exception as e2:
         raise HTTPException(502, f"TWSE 失敗：{twse_error}；TPEx 也失敗：{e2}")
 
-    # 兩邊都沒資料
     raise HTTPException(404, f"查不到資料：TWSE={twse_error}；TPEx=回空資料（可能區間無交易或代號不正確）")
