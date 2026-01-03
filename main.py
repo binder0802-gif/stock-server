@@ -1,3 +1,4 @@
+from db import init_db, fetch_range, upsert_many
 from fastapi import FastAPI, HTTPException
 from datetime import date, datetime, timedelta
 import urllib.request
@@ -11,7 +12,7 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 app = FastAPI()
-
+init_db()
 # -------------------------
 # 基本首頁：測試服務活著
 # -------------------------
@@ -278,3 +279,4 @@ def stock_history(stock_id: str, start: str, end: str):
         raise HTTPException(502, f"TWSE 失敗：{twse_error}；TPEx 也失敗：{e2}")
 
     raise HTTPException(404, f"查不到資料：TWSE={twse_error}；TPEx=回空資料（可能區間無交易或代號不正確）")
+
